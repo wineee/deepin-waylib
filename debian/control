@@ -3,15 +3,15 @@ Section: libdevel
 Priority: optional
 Maintainer: JiDe Zhang <zhangjide@deepin.org>
 Build-Depends: cmake,
-               debhelper (>= 9),
+               debhelper (>= 9.0.0),
                libpixman-1-dev,
-               libwlroots-dev (>= 0.17.0),
+               libwlroots-0.18-dev,
                libxcb-ewmh-dev,
                pkg-config,
                qml6-module-qtquick-templates,
-               qt6-base-dev-tools (>= 6.4.0),
-               qt6-base-private-dev (>= 6.4.0),
-               qt6-declarative-private-dev (>= 6.4.0),
+               qt6-base-dev-tools (>= 6.6.0),
+               qt6-base-private-dev (>= 6.6.0),
+               qt6-declarative-private-dev (>= 6.6.0),
                qwlroots,
                wayland-protocols,
                wlr-protocols,
@@ -28,7 +28,7 @@ Description:  A wrapper for wlroots based on Qt
 Package: libwaylib-dev
 Architecture: any
 Depends: libwaylib (=${binary:Version}),
-         libwlroots-dev (>= 0.17.0),
+         libwlroots-0.18-dev,
          qt6-base-dev-tools (>= 6.6.0),
          qt6-base-private-dev (>= 6.6.0),
          qt6-declarative-private-dev (>= 6.6.0),

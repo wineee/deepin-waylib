@@ -13,6 +13,8 @@
 #include "wbufferrenderer_p.h"
 #include "wquicktextureproxy.h"
 #include "weventjunkman.h"
+#include "winputdevice.h"
+#include "wseat.h"
 
 #include "platformplugin/qwlrootsintegration.h"
 #include "platformplugin/qwlrootscreen.h"
@@ -30,6 +32,7 @@
 #include <qwswapchain.h>
 #include <qwoutputlayer.h>
 #include <qwegl.h>
+#include <qwoutputinterface.h>
 
 #include <QOffscreenSurface>
 #include <QQuickRenderControl>
@@ -842,7 +845,8 @@ WBufferRenderer *OutputHelper::afterRender()
         return bufferRenderer();
     }
 
-    const bool ok = WOutputHelper::testCommit(bufferRenderer()->currentBuffer(), layers);
+    static bool noHardwareLayers = qEnvironmentVariableIsSet("WAYLIB_NO_HARDWARE_LAYERS");
+    const bool ok = !noHardwareLayers && WOutputHelper::testCommit(bufferRenderer()->currentBuffer(), layers);
     int needsSoftwareCompositeBeginIndex = -1;
     int needsSoftwareCompositeEndIndex = -1;
     bool forceShadowRender = false;
@@ -947,9 +951,7 @@ WBufferRenderer *OutputHelper::compositeLayers(const QList<LayerData*> layers, b
 {
     Q_ASSERT(!layers.isEmpty());
 
-    const bool usingShadowRenderer = forceShadowRenderer
-                                     // TODO: Support preserveColorContents in Qt in QSGSoftwareRenderer
-                                     || dynamic_cast<QSGSoftwareRenderer*>(renderWindowD()->renderer);
+    const bool usingShadowRenderer = forceShadowRenderer;
 
     if (!m_layerPorxyContainer) {
         m_layerPorxyContainer = new QQuickItem(renderWindow()->contentItem());
@@ -978,6 +980,8 @@ WBufferRenderer *OutputHelper::compositeLayers(const QList<LayerData*> layers, b
         auto outputProxy = m_layerProxys.first();
         outputProxy->setRenderer(bufferRenderer());
         outputProxy->setSize(output->size());
+        outputProxy->setPosition({0, 0});
+        outputProxy->setZ(0);
     } else {
         output = m_output;
 
@@ -1093,14 +1097,33 @@ bool OutputHelper::tryToHardwareCursor(const LayerData *layer)
             break;
 
         QSize pixelSize = QSize(buffer->width, buffer->height);
-        auto get_cursor_size = qwoutput()->handle()->impl->get_cursor_size;
+        auto get_cursor_sizes = qwoutput()->handle()->impl->get_cursor_sizes;
         auto get_cursor_formsts = qwoutput()->handle()->impl->get_cursor_formats;
-        if (get_cursor_size) {
-            get_cursor_size(qwoutput()->handle(), &pixelSize.rwidth(), &pixelSize.rheight());
+        bool needsRepaintCursor = get_cursor_sizes && get_cursor_formsts;
+
+        if (get_cursor_sizes) {
+            bool foundTargetSize = false;
+            size_t sizes_len = 0;
+            const auto sizes = get_cursor_sizes(qwoutput()->handle(), &sizes_len);
+            for (size_t i = 0; i < sizes_len; ++i) {
+                if (sizes[i].width == pixelSize.width()
+                    && sizes[i].height == pixelSize.height()) {
+                    foundTargetSize = true;
+                    break;
+                }
+            }
+
+            if (!foundTargetSize && sizes_len > 0) {
+                // Use the request size wlroots's backend to render the cursor
+                pixelSize.rwidth() = sizes[0].width;
+                pixelSize.rheight() = sizes[0].height;
+                needsRepaintCursor = true;
+            } else {
+                needsRepaintCursor = false;
+            }
         }
 
-        if (pixelSize != QSize(buffer->width, buffer->height)
-            || (get_cursor_formsts && get_cursor_size)) {
+        if (needsRepaintCursor) {
             // needs render cursor again
             if (!m_cursorRenderer) {
                 m_cursorRenderer = new WBufferRenderer(renderWindow()->contentItem());
@@ -1350,6 +1373,7 @@ bool WOutputRenderWindowPrivate::initRCWithRhi()
 
 void WOutputRenderWindowPrivate::updateSceneDPR()
 {
+    W_Q(WOutputRenderWindow);
     if (outputs.isEmpty()
         // Maybe the platform window is destroyed
         || !platformWindow) {
@@ -1364,6 +1388,7 @@ void WOutputRenderWindowPrivate::updateSceneDPR()
     }
 
     setSceneDevicePixelRatio(maxDPR);
+    Q_EMIT q->effectiveDevicePixelRatioChanged(maxDPR);
 }
 
 void WOutputRenderWindowPrivate::sortOutputs()
@@ -1518,10 +1543,14 @@ WOutputRenderWindow::WOutputRenderWindow(QObject *parent)
     // see [QQuickApplicationWindow](qt6/qtdeclarative/src/quicktemplates/qquickapplicationwindow.cpp)
     contentItem()->setFlag(QQuickItem::ItemIsFocusScope);
     contentItem()->setFocus(true);
+
+    qGuiApp->installEventFilter(this);
 }
 
 WOutputRenderWindow::~WOutputRenderWindow()
 {
+    qGuiApp->removeEventFilter(this);
+
     renderControl()->disconnect(this);
     renderControl()->invalidate();
     renderControl()->deleteLater();
@@ -1842,8 +1871,7 @@ void WOutputRenderWindow::update()
 {
     Q_D(WOutputRenderWindow);
     for (auto o : std::as_const(d->outputs))
-        o->update(); // make contents to dirty
-    d->scheduleDoRender();
+        o->update(); // will scheduleDoRender
 }
 
 void WOutputRenderWindow::update(WOutputViewport *output)
@@ -1937,6 +1965,20 @@ bool WOutputRenderWindow::event(QEvent *event)
         return true;
 
     return isAccepted;
+}
+
+bool WOutputRenderWindow::eventFilter(QObject *watched, QEvent *event)
+{
+    if (event->isInputEvent() && watched->isQuickItemType()) {
+        auto ie = static_cast<QInputEvent*>(event);
+        auto device = WInputDevice::from(ie->device());
+        Q_ASSERT(device);
+        Q_ASSERT(device->seat());
+        if (device->seat()->filterEventBeforeDisposeStage(qobject_cast<QQuickItem*>(watched), ie))
+            return true;
+    }
+
+    return QQuickWindow::eventFilter(watched, event);
 }
 
 WAYLIB_SERVER_END_NAMESPACE

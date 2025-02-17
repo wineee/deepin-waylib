@@ -5,8 +5,10 @@
 
 #include "private/wtoplevelsurface_p.h"
 #include "wsurface.h"
+
 #include <qwcompositor.h>
 #include <qwinputmethodv2.h>
+#include <qwbox.h>
 
 QW_USE_NAMESPACE
 WAYLIB_SERVER_BEGIN_NAMESPACE
@@ -28,6 +30,10 @@ public:
     QSize size() const
     {
         return {handle()->handle()->surface->current.width, handle()->handle()->surface->current.height};
+    }
+
+    wl_client *waylandClient() const override {
+        return nativeHandle()->resource->client;
     }
 
     WSurface *const parent;
@@ -85,9 +91,9 @@ WSurface *WInputPopupSurface::parentSurface() const
     return d_func()->parent;
 }
 
-bool WInputPopupSurface::checkNewSize(const QSize &size)
+bool WInputPopupSurface::checkNewSize(const QSize &, QSize *)
 {
-    return size == d_func()->size();
+    return false;
 }
 
 QRect WInputPopupSurface::cursorRect() const

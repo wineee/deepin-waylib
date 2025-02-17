@@ -9,8 +9,9 @@ Item {
     id: root
 
     required property SurfaceItem surface
-    readonly property SurfaceWrapper wrapper: surface?.parent ?? null
-    readonly property real cornerRadius: wrapper?.radius ?? cornerRadius
+    // surface?.parent maybe is a `SubsurfaceContainer`
+    readonly property SurfaceWrapper wrapper: surface?.parent as SurfaceWrapper
+    readonly property real cornerRadius: wrapper?.radius ?? 0
 
     anchors.fill: parent
     SurfaceItemContent {
@@ -20,6 +21,10 @@ Item {
         opacity: effectLoader.active ? 0 : 1
         live: root.surface && !(root.surface.flags & SurfaceItem.NonLive)
         smooth: root.surface?.smooth ?? true
+
+        onDevicePixelRatioChanged: {
+            wrapper.updateSurfaceSizeRatio()
+        }
     }
 
     Loader {
@@ -36,7 +41,8 @@ Item {
             sourceItem: content
             radius: cornerRadius
             targetRect: Qt.rect(-surface?.leftPadding ?? 0, -surface?.topPadding ?? 0,
-                                root.surface?.width ?? 0, root.surface?.height ?? 0)
+                                root.surface?.width * root.surface?.surfaceSizeRatio ?? 0,
+                                root.surface?.height * root.surface?.surfaceSizeRatio ?? 0)
         }
     }
 }

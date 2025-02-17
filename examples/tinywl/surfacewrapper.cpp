@@ -6,7 +6,8 @@
 #include "output.h"
 
 #include <woutput.h>
-#include <wxdgsurfaceitem.h>
+#include <wxdgtoplevelsurfaceitem.h>
+#include <wxdgpopupsurfaceitem.h>
 #include <wlayersurfaceitem.h>
 #include <wxwaylandsurfaceitem.h>
 #include <winputpopupsurfaceitem.h>
@@ -30,14 +31,28 @@ SurfaceWrapper::SurfaceWrapper(QmlEngine *qmlEngine, WToplevelSurface *shellSurf
 {
     QQmlEngine::setContextForObject(this, qmlEngine->rootContext());
 
-    if (type == Type::XWayland) {
-        m_surfaceItem = new WXWaylandSurfaceItem(this);
-    } else if (type == Type::Layer) {
+    switch (type) {
+    case Type::XdgToplevel:
+        m_surfaceItem = new WXdgToplevelSurfaceItem(this);
+        break;
+    case Type::XdgPopup:
+        m_surfaceItem = new WXdgPopupSurfaceItem(this);
+        break;
+    case Type::Layer:
         m_surfaceItem = new WLayerSurfaceItem(this);
-    } else if (type == Type::InputPopup) {
+        break;
+    case Type::XWayland: {
+        m_surfaceItem = new WXWaylandSurfaceItem(this);
+        connect(m_surfaceItem, &WSurfaceItem::bufferScaleChanged,
+                this, &SurfaceWrapper::updateSurfaceSizeRatio);
+        updateSurfaceSizeRatio();
+        break;
+    }
+    case Type::InputPopup:
         m_surfaceItem = new WInputPopupSurfaceItem(this);
-    } else {
-        m_surfaceItem = new WXdgSurfaceItem(this);
+        break;
+    default:
+        Q_UNREACHABLE();
     }
 
     QQmlEngine::setContextForObject(m_surfaceItem, qmlEngine->rootContext());
@@ -67,7 +82,7 @@ SurfaceWrapper::SurfaceWrapper(QmlEngine *qmlEngine, WToplevelSurface *shellSurf
     connect(m_surfaceItem, &WSurfaceItem::implicitWidthChanged, this, [this] {
         setImplicitWidth(m_surfaceItem->implicitWidth());
     });
-    connect(m_surfaceItem, &WSurfaceItem::heightChanged, this, [this] {
+    connect(m_surfaceItem, &WSurfaceItem::implicitHeightChanged, this, [this] {
         setImplicitHeight(m_surfaceItem->implicitHeight());
     });
     setImplicitSize(m_surfaceItem->implicitWidth(), m_surfaceItem->implicitHeight());
@@ -217,6 +232,11 @@ void SurfaceWrapper::setMaximizedGeometry(const QRectF &newMaximizedGeometry)
     if (m_maximizedGeometry == newMaximizedGeometry)
         return;
     m_maximizedGeometry = newMaximizedGeometry;
+    // This geometry change might be caused by a change in the output size due to screen scaling.
+    // Ensure that the surfaceSizeRatio is updated before modifying the window size
+    // to avoid incorrect sizing of Xwayland windows.
+    updateSurfaceSizeRatio();
+
     if (m_surfaceState == State::Maximized) {
         setPosition(newMaximizedGeometry.topLeft());
         resize(newMaximizedGeometry.size());
@@ -237,6 +257,11 @@ void SurfaceWrapper::setFullscreenGeometry(const QRectF &newFullscreenGeometry)
     if (m_fullscreenGeometry == newFullscreenGeometry)
         return;
     m_fullscreenGeometry = newFullscreenGeometry;
+    // This geometry change might be caused by a change in the output size due to screen scaling.
+    // Ensure that the surfaceSizeRatio is updated before modifying the window size
+    // to avoid incorrect sizing of Xwayland windows.
+    updateSurfaceSizeRatio();
+
     if (m_surfaceState == State::Fullscreen) {
         setPosition(newFullscreenGeometry.topLeft());
         resize(newFullscreenGeometry.size());
@@ -259,6 +284,11 @@ void SurfaceWrapper::setTilingGeometry(const QRectF &newTilingGeometry)
     if (m_tilingGeometry == newTilingGeometry)
         return;
     m_tilingGeometry = newTilingGeometry;
+    // This geometry change might be caused by a change in the output size due to screen scaling.
+    // Ensure that the surfaceSizeRatio is updated before modifying the window size
+    // to avoid incorrect sizing of Xwayland windows.
+    updateSurfaceSizeRatio();
+
     if (m_surfaceState == State::Tiling) {
         setPosition(newTilingGeometry.topLeft());
         resize(newTilingGeometry.size());
@@ -461,6 +491,10 @@ void SurfaceWrapper::updateTitleBar()
     } else {
         m_titleBar = m_engine->createTitleBar(this, m_surfaceItem);
         m_titleBar->setZ(static_cast<int>(WSurfaceItem::ZOrder::ContentItem));
+        if (type() == Type::XWayland) {
+            auto xwaylandSurfaceItem = qobject_cast<WXWaylandSurfaceItem*>(m_surfaceItem);
+            xwaylandSurfaceItem->moveTo(QPointF(0, m_titleBar->height()), !m_xwaylandPositionFromSurface);
+        }
         m_surfaceItem->setTopPadding(m_titleBar->height());
         connect(m_titleBar, &QQuickItem::heightChanged, this, [this] {
             m_surfaceItem->setTopPadding(m_titleBar->height());
@@ -534,6 +568,15 @@ void SurfaceWrapper::geometryChange(const QRectF &newGeo, const QRectF &oldGeome
     if (newGeometry.size() != oldGeometry.size())
         updateBoundingRect();
     updateClipRect();
+}
+
+void SurfaceWrapper::itemChange(ItemChange change, const ItemChangeData &data)
+{
+    if (change == ItemSceneChange) {
+        updateSurfaceSizeRatio();
+    }
+
+    return QQuickItem::itemChange(change, data);
 }
 
 void SurfaceWrapper::doSetSurfaceState(State newSurfaceState)
@@ -625,6 +668,11 @@ bool SurfaceWrapper::startStateChangeAnimation(State targetState, const QRectF &
 
 qreal SurfaceWrapper::radius() const
 {
+    // RoundedClipEffect is use ShaderEffectSource to clip, its only
+    // supports RHI backend.
+    if (window()->sceneGraphBackend() == "software")
+        return 0;
+
     return m_radius;
 }
 
@@ -992,6 +1040,17 @@ void SurfaceWrapper::updateExplicitAlwaysOnTop()
     setZ(m_explicitAlwaysOnTop ? 1 : 0);
     for (const auto& sub : std::as_const(m_subSurfaces))
         sub->updateExplicitAlwaysOnTop();
+}
+
+void SurfaceWrapper::updateSurfaceSizeRatio()
+{
+    if (m_type == Type::XWayland && m_surfaceItem && window()) {
+        const qreal targetScale = window()->effectiveDevicePixelRatio();
+        if (m_surfaceItem->bufferScale() < targetScale)
+            m_surfaceItem->setSurfaceSizeRatio(targetScale / m_surfaceItem->bufferScale());
+        else
+            m_surfaceItem->setSurfaceSizeRatio(1.0);
+    }
 }
 
 void SurfaceWrapper::setXwaylandPositionFromSurface(bool value)

@@ -16,6 +16,7 @@
 #include <qwrendererinterface.h>
 
 #include <QSGImageNode>
+#include <QSGSimpleRectNode>
 
 #define protected public
 #define private public
@@ -33,6 +34,7 @@
 #include <private/qrhigles2_p.h>
 #include <private/qopenglcontext_p.h>
 #endif
+#include <private/qsgbatchrenderer_p.h>
 
 #include <pixman.h>
 #include <drm_fourcc.h>
@@ -233,6 +235,17 @@ QSGRenderer *WBufferRenderer::currentRenderer() const
     return state.renderer;
 }
 
+QSGBatchRenderer::Renderer *WBufferRenderer::currentBatchRenderer() const
+{
+    Q_ASSERT(state.renderer == state.batchRenderer);
+    return state.batchRenderer;
+}
+
+qreal WBufferRenderer::currentDevicePixelRatio() const
+{
+    return state.devicePixelRatio;
+}
+
 const QMatrix4x4 &WBufferRenderer::currentWorldTransform() const
 {
     return state.worldTransform;
@@ -380,7 +393,19 @@ qw_buffer *WBufferRenderer::beginRender(const QSize &pixelSize, qreal devicePixe
 
     if (rtd->type == QQuickRenderTargetPrivate::Type::PaintDevice) {
         sgRT.paintDevice = rtd->u.paintDevice;
+
+        // // For software renderer, update the dirty parts relative to the last paint device.
+        PixmanRegion damage;
+        m_damageRing.get_buffer_damage(bufferAge, damage);
+        state.dirty = WTools::fromPixmanRegion(damage);
+
+        if (devicePixelRatio != 1.0) {
+            state.dirty = QTransform::fromScale(1.0 / devicePixelRatio,
+                                                1.0 / devicePixelRatio).map(state.dirty);
+        }
     } else {
+        state.dirty = QRegion();
+
         Q_ASSERT(rtd->type == QQuickRenderTargetPrivate::Type::RhiRenderTarget);
         sgRT.rt = rtd->u.rhiRt;
         sgRT.cb = wd->redirect.commandBuffer;
@@ -403,7 +428,6 @@ qw_buffer *WBufferRenderer::beginRender(const QSize &pixelSize, qreal devicePixe
     state.pixelSize = pixelSize;
     state.devicePixelRatio = devicePixelRatio;
     state.bufferAge = bufferAge;
-    state.lastRT = lastRT;
     state.buffer = buffer;
     state.renderTarget = rt;
     state.sgRenderTarget = sgRT;
@@ -428,8 +452,29 @@ void WBufferRenderer::render(int sourceIndex, const QMatrix4x4 &renderMatrix,
 
     const qreal devicePixelRatio = state.devicePixelRatio;
     state.renderer = renderer;
+    state.batchRenderer = dynamic_cast<QSGBatchRenderer::Renderer*>(renderer);
     state.worldTransform = renderMatrix;
-    renderer->setDevicePixelRatio(devicePixelRatio);
+    // The renderer should always receive the window's DPR (Device Pixel Ratio)
+    // because, regardless of the DPR used for rendering, all resources within
+    // a window are loaded based on the window's own DPR.
+
+    // During rendering, certain specialized nodes (e.g., QSGCurveStrokeMaterialShader)
+    // use QSGRenderer::devicePixelRatio for specific calculations related to
+    // ShapePath::fillItem. When displaying this fillItem using Shape, it might
+    // be desirable for the QSGTexture provided by fillItem to scale completely
+    // to match the size of the Shape, regardless of its original size.
+
+    // If a PathRectangle is used, its width is set to
+    // textureSize.width / QQuickWindow::effectiveDevicePixelRatio. Here, the
+    // devicePixelRatio value is utilized because the width and height passed
+    // to PathRectangle need to be converted from pixel values to pixel-independent sizes.
+
+    // Returning to the issue mentioned earlier, QSGCurveStrokeMaterialShader
+    // uses QSGRenderer::devicePixelRatio for additional calculations that influence
+    // how Shape fills the QSGTexture provided by fillItem. Therefore, we need to ensure
+    // that QSGRenderer::devicePixelRatio and QQuickWindow::effectiveDevicePixelRatio
+    // are always consistent. Otherwise, some Items might render incorrectly.
+    renderer->setDevicePixelRatio(window()->effectiveDevicePixelRatio());
     renderer->setDeviceRect(QRect(QPoint(0, 0), state.pixelSize));
     renderer->setRenderTarget(state.sgRenderTarget);
     const auto viewportRect = scaleToRect(targetRect, devicePixelRatio);
@@ -437,6 +482,23 @@ void WBufferRenderer::render(int sourceIndex, const QMatrix4x4 &renderMatrix,
     auto softwareRenderer = dynamic_cast<QSGSoftwareRenderer*>(renderer);
     { // before render
         if (softwareRenderer) {
+            // Avoid do clear before paint, for the software renderer this
+            // work is expensive.
+            if (m_clearColor.alpha() == 0)
+                preserveColorContents = true;
+#if QT_VERSION >= QT_VERSION_CHECK(6, 9, 0)
+            softwareRenderer->setClearColorEnabled(!preserveColorContents);
+#else
+            auto bn = softwareRenderer->renderableNode(softwareRenderer->m_background);
+            if (bn) {
+                bn->m_opacity = preserveColorContents ? 0 : 1;
+            }
+#endif
+            if (!state.dirty.isEmpty()) {
+                softwareRenderer->m_dirtyRegion += state.dirty;
+                state.dirty = QRegion();
+            }
+
             // because software renderer don't supports viewportRect,
             // so use transform to simulation.
             const auto mapTransform = inputMapToOutput(sourceRect, targetRect,
@@ -532,6 +594,8 @@ void WBufferRenderer::render(int sourceIndex, const QMatrix4x4 &renderMatrix,
             // drawing result is available for use.
             wd->rhi->finish();
         } else {
+            state.dirty = softwareRenderer->flushRegion();
+
             auto currentImage = getImageFrom(state.renderTarget);
             Q_ASSERT(currentImage && currentImage == softwareRenderer->m_rt.paintDevice);
             currentImage->setDevicePixelRatio(1.0);
@@ -558,28 +622,6 @@ void WBufferRenderer::render(int sourceIndex, const QMatrix4x4 &renderMatrix,
                             pa.fillRect(r, softwareRenderer->clearColor());
                     }
                 }
-
-                if (!damage.isEmpty() && state.lastRT.first != state.buffer && !state.lastRT.second.isNull()) {
-                    auto image = getImageFrom(state.lastRT.second);
-                    Q_ASSERT(image);
-                    Q_ASSERT(image->size() == state.pixelSize);
-
-                    // TODO: Don't use the previous render target, we can get the damage region of QtQuick
-                    // before QQuickRenderControl::render for qw_damage_ring, and add dirty region to
-                    // QSGAbstractSoftwareRenderer to force repaint the damage region of current render target.
-                    QPainter pa(currentImage);
-
-                    PixmanRegion remainderDamage;
-                    ok = pixman_region32_subtract(remainderDamage, damage, scaledFlushDamage);
-                    Q_ASSERT(ok);
-
-                    int count = 0;
-                    auto rects = pixman_region32_rectangles(remainderDamage, &count);
-                    for (int i = 0; i < count; ++i) {
-                        auto r = rects[i];
-                        pa.drawImage(r.x1, r.y1, *image, r.x1, r.y1, r.x2 - r.x1, r.y2 - r.y1);
-                    }
-                }
             }
 
             if (!isRootItem(source.source))
@@ -603,6 +645,8 @@ void WBufferRenderer::endRender()
     auto buffer = state.buffer;
     state.buffer = nullptr;
     state.renderer = nullptr;
+    state.batchRenderer = nullptr;
+    state.dirty = QRegion();
 
     m_lastBuffer = buffer;
     m_damageRing.rotate();

@@ -6,6 +6,10 @@
 #include "wrenderhelper.h"
 #include "private/wglobal_p.h"
 
+#include <qwtexture.h>
+#include <qwbuffer.h>
+#include <qwrenderer.h>
+
 #include <rhi/qrhi.h>
 #include <private/qsgplaintexture_p.h>
 
@@ -25,6 +29,10 @@ public:
         , window(window)
     {
         qtTexture.setOwnsTexture(false);
+        qtTexture.setFiltering(smooth ? QSGTexture::Linear
+                                      : QSGTexture::Nearest);
+        qtTexture.setMipmapFiltering(smooth ? QSGTexture::Linear
+                                            : QSGTexture::Nearest);
     }
 
     ~WSGTextureProviderPrivate() {
@@ -81,6 +89,7 @@ public:
     // qt resources
     QSGPlainTexture qtTexture;
     QRhiTexture *rhiTexture = nullptr;
+    bool smooth = true;
 };
 
 WSGTextureProvider::WSGTextureProvider(WOutputRenderWindow *window)
@@ -104,12 +113,21 @@ void WSGTextureProvider::setBuffer(qw_buffer *buffer)
 
     W_D(WSGTextureProvider);
     d->cleanTexture();
-    d->ownsTexture = true;
     d->buffer = buffer;
 
     if (buffer) {
         Q_ASSERT(d->window);
-        d->texture = qw_texture::from_buffer(*d->window->renderer(), *buffer);
+        if (auto clientBuffer = qw_client_buffer::get(*buffer)) {
+            // Acquire texture from client buffer. wlroots already generate texture for us if this is a client buffer.
+            // By the way, there is something wrong with getting texture from a client buffer using wlr_texture_from_buffer,
+            // See: https://gitlab.freedesktop.org/wlroots/wlroots/-/issues/3897
+            // Possible patch:  https://gitlab.freedesktop.org/wlroots/wlroots/-/merge_requests/4889
+            d->texture = qw_texture::from(clientBuffer->handle()->texture);
+            d->ownsTexture = false;
+        } else {
+            d->texture = qw_texture::from_buffer(*d->window->renderer(), *buffer);
+            d->ownsTexture = true;
+        }
         if (Q_UNLIKELY(!d->texture)) {
             qCWarning(lcQtQuickTexture) << "Failed to update texture from buffer:" << buffer
                                         << ", width height:" << buffer->handle()->width
@@ -161,6 +179,26 @@ qw_buffer *WSGTextureProvider::qwBuffer() const
 {
     W_DC(WSGTextureProvider);
     return d->buffer;
+}
+
+bool WSGTextureProvider::smooth() const
+{
+    W_DC(WSGTextureProvider);
+    return d->smooth;
+}
+
+void WSGTextureProvider::setSmooth(bool newSmooth)
+{
+    W_D(WSGTextureProvider);
+    if (d->smooth == newSmooth)
+        return;
+    d->smooth = newSmooth;
+    d->qtTexture.setFiltering(newSmooth ? QSGTexture::Linear
+                                        : QSGTexture::Nearest);
+    d->qtTexture.setMipmapFiltering(newSmooth ? QSGTexture::Linear
+                                              : QSGTexture::Nearest);
+
+    Q_EMIT smoothChanged();
 }
 
 WAYLIB_SERVER_END_NAMESPACE

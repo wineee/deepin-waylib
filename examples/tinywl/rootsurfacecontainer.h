@@ -47,6 +47,8 @@ public:
         PopupZOrder = 4,
     };
 
+    void init(WServer *server);
+
     SurfaceWrapper *getSurface(WSurface *surface) const;
     SurfaceWrapper *getSurface(WToplevelSurface *surface) const;
     void destroyForSurface(WSurface *surface);
@@ -96,7 +98,7 @@ private:
     OutputListModel *m_outputModel = nullptr;
     QPointer<Output> m_primaryOutput;
     WCursor *m_cursor = nullptr;
-    WSurfaceItem *m_dargSurfaceItem = nullptr;
+    WSurfaceItem *m_dragSurfaceItem = nullptr;
 
     // for move resize
     struct {

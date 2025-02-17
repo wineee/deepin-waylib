@@ -93,6 +93,7 @@ public:
     int32_t topMargin() const;
     int32_t bottomMargin() const;
     KeyboardInteractivity keyboardInteractivity() const;
+    QString scope() const;
     WOutput *output() const;
     Q_INVOKABLE AnchorType getExclusiveZoneEdge() const;
     Q_INVOKABLE uint32_t configureSize(const QSize &newSize);
@@ -114,7 +115,7 @@ Q_SIGNALS:
     void layerPropertiesChanged();
 
 public Q_SLOTS:
-    bool checkNewSize(const QSize &size) override;
+    bool checkNewSize(const QSize &size,  QSize *clipedSize = nullptr) override;
 };
 
 Q_DECLARE_OPERATORS_FOR_FLAGS(WLayerSurface::AnchorTypes)

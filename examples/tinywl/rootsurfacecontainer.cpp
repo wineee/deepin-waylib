@@ -11,6 +11,9 @@
 #include <woutputitem.h>
 #include <woutput.h>
 #include <wxdgsurface.h>
+#include <wxdgpopupsurface.h>
+
+#include <qwoutputlayout.h>
 
 #include <QQuickWindow>
 
@@ -24,12 +27,16 @@ OutputListModel::OutputListModel(QObject *parent)
 
 RootSurfaceContainer::RootSurfaceContainer(QQuickItem *parent)
     : SurfaceContainer(parent)
-    , m_outputLayout(new WOutputLayout(this))
     , m_outputModel(new OutputListModel(this))
     , m_cursor(new WCursor(this))
 {
-    m_cursor->setLayout(m_outputLayout);
     m_cursor->setEventWindow(window());
+}
+
+void RootSurfaceContainer::init(WServer *server)
+{
+    m_outputLayout = new WOutputLayout(server);
+    m_cursor->setLayout(m_outputLayout);
 
     connect(m_outputLayout, &WOutputLayout::implicitWidthChanged, this, [this] {
         const auto width = m_outputLayout->implicitWidth();
@@ -43,7 +50,7 @@ RootSurfaceContainer::RootSurfaceContainer(QQuickItem *parent)
         setHeight(height);
     });
 
-    connect(m_outputLayout, &WOutputLayout::notify_change, this, [this] {
+    m_outputLayout->safeConnect(&qw_output_layout::notify_change, this, [this] {
         for (auto output : std::as_const(outputs())) {
             output->updatePositionFromLayout();
         }
@@ -56,16 +63,16 @@ RootSurfaceContainer::RootSurfaceContainer(QQuickItem *parent)
         // }
     });
 
-    m_dargSurfaceItem = new WSurfaceItem(window()->contentItem());
-    m_dargSurfaceItem->setZ(static_cast<std::underlying_type_t<WOutputLayout::Layer>>(WOutputLayout::Layer::Cursor) - 1);
-    m_dargSurfaceItem->setFlags(WSurfaceItem::DontCacheLastBuffer);
+    m_dragSurfaceItem = new WSurfaceItem(window()->contentItem());
+    m_dragSurfaceItem->setZ(static_cast<std::underlying_type_t<WOutputLayout::Layer>>(WOutputLayout::Layer::Cursor) - 1);
+    m_dragSurfaceItem->setFlags(WSurfaceItem::DontCacheLastBuffer);
 
     m_cursor->safeConnect(&WCursor::positionChanged, this, [this] {
-        m_dargSurfaceItem->setPosition(m_cursor->position());
+        m_dragSurfaceItem->setPosition(m_cursor->position());
     });
 
     m_cursor->safeConnect(&WCursor::requestedDragSurfaceChanged, this, [this] {
-        m_dargSurfaceItem->setSurface(m_cursor->requestedDragSurface());
+        m_dragSurfaceItem->setSurface(m_cursor->requestedDragSurface());
     });
 }
 
@@ -117,6 +124,7 @@ void RootSurfaceContainer::removeOutput(Output *output)
         endMoveResize();
     }
 
+    m_outputLayout->remove(output->output());
     if (m_primaryOutput == output) {
         const auto outputs = m_outputLayout->outputs();
         if (!outputs.isEmpty()) {
@@ -136,8 +144,6 @@ void RootSurfaceContainer::removeOutput(Output *output)
         else
             Helper::instance()->setCursorPosition(m_primaryOutput->geometry().center());
     }
-
-    m_outputLayout->remove(output->output());
 }
 
 void RootSurfaceContainer::beginMoveResize(SurfaceWrapper *surface, Qt::Edges edges)
@@ -264,10 +270,10 @@ void RootSurfaceContainer::addBySubContainer(SurfaceContainer *sub, SurfaceWrapp
         auto parentSurface = surface->parentSurface();
         auto output = parentSurface ? parentSurface->ownsOutput() : primaryOutput();
 
-        if (auto xdgSurface = qobject_cast<WXdgSurface*>(surface->shellSurface())) {
-            if (xdgSurface->isPopup() && parentSurface->type() != SurfaceWrapper::Type::Layer) {
-                auto pos = parentSurface->position() + parentSurface->surfaceItem()->position() + xdgSurface->getPopupPosition();
-                if (auto op = m_outputLayout->output_at(pos.x(), pos.y()))
+        if (auto xdgPopupSurface = qobject_cast<WXdgPopupSurface*>(surface->shellSurface())) {
+            if (parentSurface->type() != SurfaceWrapper::Type::Layer) {
+                auto pos = parentSurface->position() + parentSurface->surfaceItem()->position() + xdgPopupSurface->getPopupPosition();
+                if (auto op = m_outputLayout->handle()->output_at(pos.x(), pos.y()))
                     output = Helper::instance()->getOutput(WOutput::fromHandle(qw_output::from(op)));
             }
         }
@@ -279,7 +285,8 @@ void RootSurfaceContainer::addBySubContainer(SurfaceContainer *sub, SurfaceWrapp
     });
 
     updateSurfaceOutputs(surface);
-    Helper::instance()->activeSurface(surface, Qt::OtherFocusReason);
+    if (surface->shellSurface()->surface()->mapped())
+        Helper::instance()->activeSurface(surface, Qt::OtherFocusReason);
 }
 
 void RootSurfaceContainer::removeBySubContainer(SurfaceContainer *sub, SurfaceWrapper *surface)
@@ -342,7 +349,7 @@ Output *RootSurfaceContainer::cursorOutput() const
 {
     Q_ASSERT(m_cursor->layout() == m_outputLayout);
     const auto &pos = m_cursor->position();
-    auto o = m_outputLayout->output_at(pos.x(), pos.y());
+    auto o = m_outputLayout->handle()->output_at(pos.x(), pos.y());
     if (!o)
         return nullptr;
 
@@ -370,7 +377,7 @@ const QList<Output*> &RootSurfaceContainer::outputs() const
 void RootSurfaceContainer::ensureCursorVisible()
 {
     const auto cursorPos = m_cursor->position();
-    if (m_outputLayout->output_at(cursorPos.x(), cursorPos.y()))
+    if (m_outputLayout->handle()->output_at(cursorPos.x(), cursorPos.y()))
         return;
 
     if (m_primaryOutput) {

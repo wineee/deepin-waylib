@@ -26,6 +26,55 @@
 QW_USE_NAMESPACE
 WAYLIB_SERVER_BEGIN_NAMESPACE
 
+class Q_DECL_HIDDEN SubsurfaceContainer : public QQuickItem
+{
+    Q_OBJECT
+public:
+    explicit SubsurfaceContainer(WSurfaceItem *mainSurface)
+        : QQuickItem(mainSurface)
+    {
+    }
+
+    bool isEmpty() const {
+        return m_subsurfaces.empty();
+    }
+
+    void deleteAfterEmpty() {
+        m_deleteAfterEmpty = true;
+    }
+Q_SIGNALS:
+    void subsurfaceRemoved(WAYLIB_SERVER_NAMESPACE::WSurfaceItem *item);
+
+protected:
+    void itemChange(ItemChange change, const ItemChangeData &data) override
+    {
+        switch (change) {
+        case QQuickItem::ItemChildAddedChange: {
+            auto surfaceItem = static_cast<WSurfaceItem *>(data.item);
+            Q_ASSERT(surfaceItem); // TODO: check isSubsurface, may segmentation fault now.
+            m_subsurfaces.append(surfaceItem);
+            m_deleteAfterEmpty = false;
+            break;
+        }
+        case QQuickItem::ItemChildRemovedChange: {
+            auto surfaceItem = static_cast<WSurfaceItem *>(data.item);
+            Q_ASSERT(surfaceItem && m_subsurfaces.contains(surfaceItem));
+            m_subsurfaces.removeOne(surfaceItem);
+            Q_EMIT subsurfaceRemoved(surfaceItem);
+            if (m_deleteAfterEmpty)
+                deleteLater();
+            break;
+        }
+        default:
+            break;
+        }
+    }
+
+private:
+    QList<WSurfaceItem *> m_subsurfaces;
+    bool m_deleteAfterEmpty {false};
+};
+
 class Q_DECL_HIDDEN EventItem : public QQuickItem
 {
     Q_OBJECT
@@ -146,16 +195,22 @@ public:
 
         Q_ASSERT(!updateTextureConnection);
         updateTextureConnection = surface->safeConnect(&WSurface::bufferChanged, q, [q, this] {
-            buffer.reset(surface->buffer());
-            // lock buffer to ensure the WSurfaceItem can keep the last frame after WSurface destroyed.
-            if (buffer)
-                buffer->lock();
-            q->update();
+            if (!live) {
+                pendingBuffer.reset(surface->buffer());
+                if (pendingBuffer)
+                    pendingBuffer->lock();
+            } else {
+                buffer.reset(surface->buffer());
+                // lock buffer to ensure the WSurfaceItem can keep the last frame after WSurface destroyed.
+                if (buffer)
+                    buffer->lock();
+                q->update();
+            }
         });
 
         updateFrameDoneConnection();
         updateSurfaceState();
-        q->rendered = true;
+        rendered = true;
     }
 
     void updateFrameDoneConnection() {
@@ -168,9 +223,9 @@ public:
 
         // wayland protocol job should not run in rendering thread, so set context qobject to contentItem
         frameDoneConnection = QObject::connect(q->window(), &QQuickWindow::afterRendering, q, [this, q](){
-            if ((q->rendered || q->isVisible()) && live) {
+            if ((rendered || q->isVisible()) && live) {
                 surface->notifyFrameDone();
-                q->rendered = false;
+                rendered = false;
             }
         }); // if signal is emitted from seperated rendering thread, default QueuedConnection is used
     }
@@ -181,7 +236,8 @@ public:
 
         qw_fbox tmp;
         surface->handle()->get_buffer_source_box(tmp);
-        bufferSourceBox = tmp.toQRectF();
+        auto newBufferSourceBox = tmp.toQRectF();
+        std::swap(newBufferSourceBox, bufferSourceBox);
 
         W_Q(WSurfaceItemContent);
 
@@ -191,22 +247,43 @@ public:
             Q_EMIT q->bufferOffsetChanged();
         }
 
+        if (bufferSourceBox != newBufferSourceBox) {
+            Q_EMIT q->bufferSourceRectChanged();
+        }
+
         const auto s = surface->size();
         q->setImplicitSize(s.width(), s.height());
+    }
+
+    inline void swapBufferIfNeeded() {
+        if (pendingBuffer) {
+            buffer.reset(pendingBuffer.release());
+        }
+    }
+
+    inline void setDevicePixelRatio(qreal dpr) {
+        if (dpr == devicePixelRatio)
+            return;
+        devicePixelRatio = dpr;
+        Q_EMIT q_func()->devicePixelRatioChanged();
+        Q_EMIT q_func()->bufferSourceRectChanged();
     }
 
     W_DECLARE_PUBLIC(WSurfaceItemContent)
     QPointer<WSurface> surface;
     QRectF bufferSourceBox;
     QPoint bufferOffset;
+    qreal devicePixelRatio = 1.0;
 
     QMetaObject::Connection frameDoneConnection;
     mutable WSGTextureProvider *textureProvider = nullptr;
     std::unique_ptr<qw_buffer, qw_buffer::unlocker> buffer;
+    std::unique_ptr<qw_buffer, qw_buffer::unlocker> pendingBuffer;
     mutable QMetaObject::Connection updateTextureConnection;
     bool dontCacheLastBuffer = false;
     bool live = true;
     bool ignoreBufferOffset = false;
+    QAtomicInteger<bool> rendered = false;
 };
 
 
@@ -294,6 +371,10 @@ WSGTextureProvider *WSurfaceItemContent::wTextureProvider() const
 
     if (!d->textureProvider) {
         d->textureProvider = new WSGTextureProvider(w);
+        d->textureProvider->setSmooth(smooth());
+        connect(this, &WSurfaceItemContent::smoothChanged,
+                d->textureProvider, &WSGTextureProvider::setSmooth);
+
         if (d->surface) {
             if (auto texture = d->surface->handle()->get_texture()) {
                 d->textureProvider->setTexture(qw_texture::from(texture), d->buffer.get());
@@ -337,8 +418,10 @@ void WSurfaceItemContent::setLive(bool live)
     if (d->live == live)
         return;
     d->live = live;
-    if (live)
+    if (live) {
+        d->swapBufferIfNeeded();
         update();
+    }
     Q_EMIT liveChanged();
 }
 
@@ -361,6 +444,20 @@ void WSurfaceItemContent::setIgnoreBufferOffset(bool newIgnoreBufferOffset)
         return;
     d->ignoreBufferOffset = newIgnoreBufferOffset;
     Q_EMIT ignoreBufferOffsetChanged();
+}
+
+
+QRectF WSurfaceItemContent::bufferSourceRect() const
+{
+    W_DC(WSurfaceItemContent);
+    return QRectF(d->bufferSourceBox.topLeft() / d->devicePixelRatio,
+                  d->bufferSourceBox.size() / d->devicePixelRatio);
+}
+
+qreal WSurfaceItemContent::devicePixelRatio() const
+{
+    W_DC(WSurfaceItemContent);
+    return d->devicePixelRatio;
 }
 
 void WSurfaceItemContent::componentComplete()
@@ -387,7 +484,7 @@ public:
     void render(const RenderState*) override
     {
         if (Q_LIKELY(m_owner))
-            m_owner->rendered = true;
+            m_owner->d_func()->rendered = true;
     }
 
     QPointer<WSurfaceItemContent> m_owner;
@@ -448,6 +545,9 @@ void WSurfaceItemContent::itemChange(ItemChange change, const ItemChangeData &da
     W_D(WSurfaceItemContent);
     if (change == QQuickItem::ItemSceneChange) {
         d->updateFrameDoneConnection();
+        d->setDevicePixelRatio(data.window ? data.window->effectiveDevicePixelRatio() : 1.0);
+    } else if (change == QQuickItem::ItemDevicePixelRatioHasChanged) {
+        d->setDevicePixelRatio(data.realValue);
     }
 }
 
@@ -779,14 +879,6 @@ void WSurfaceItem::itemChange(ItemChange change, const ItemChangeData &data)
         }
 
         Q_EMIT effectiveVisibleChanged();
-    } else if (change == ItemChildRemovedChange) {
-        // Don't use qobject_cast, because this item is in destroy,
-        // Use static_cast to avoid convert failed.
-        auto item = static_cast<WSurfaceItem*>(data.item);
-        if (item && d->subsurfaces.removeOne(item)) {
-            d->updateBoundingRect();
-            Q_EMIT subsurfaceRemoved(item);
-        }
     }
 }
 
@@ -889,10 +981,12 @@ bool WSurfaceItem::resizeSurface(const QSizeF &newSize)
     QRectF tmp(0, 0, newSize.width(), newSize.height());
     tmp -= d->paddings;
     // See surfaceSizeRatio, the content item maybe has been scaled.
-    const QSize mappedSize = d->contentContainer->mapRectFromItem(this, tmp).size().toSize();
-    if (!d->shellSurface->checkNewSize(mappedSize))
-        return false;
-    return doResizeSurface(mappedSize);
+    const QSize mappedSize = mapRectToItem(d->contentContainer, tmp).size().toSize();
+    QSize clipedSize;
+    if (!d->shellSurface->checkNewSize(mappedSize, &clipedSize))
+        return doResizeSurface(clipedSize);
+    else
+        return doResizeSurface(mappedSize);
 }
 
 QRectF WSurfaceItem::getContentGeometry() const
@@ -921,8 +1015,10 @@ void WSurfaceItem::surfaceSizeRatioChange()
     if (d->resizeMode != ManualResize)
         resize(d->resizeMode);
 
-    d->contentContainer->setTransformOrigin(QQuickItem::TopLeft);
-    d->contentContainer->setScale(1.0 / d->surfaceSizeRatio);
+    if (d->contentContainer) {
+        d->contentContainer->setTransformOrigin(QQuickItem::TopLeft);
+        d->contentContainer->setScale(1.0 / d->surfaceSizeRatio);
+    }
 
     if (d->surfaceState) {
         d->updateContentPosition();
@@ -1043,8 +1139,12 @@ void WSurfaceItemPrivate::initForDelegate()
 
         contentContainer->disconnect(q);
         contentContainer->deleteLater();
+    } else {
+        newContentContainer->setTransformOrigin(QQuickItem::TransformOrigin::TopLeft);
+        newContentContainer->setScale(1.0 / surfaceSizeRatio);
     }
     contentContainer = newContentContainer.release();
+
     updateEventItem(false);
     updateBoundingRect();
     if (eventItem)
@@ -1067,43 +1167,28 @@ void WSurfaceItemPrivate::updateSubsurfaceItem()
     auto surface = this->surface->handle()->handle();
     Q_ASSERT(surface);
     Q_ASSERT(contentContainer);
-
-    QQuickItem *prev = nullptr;
-    wlr_subsurface *subsurface;
-    wl_list_for_each(subsurface, &surface->current.subsurfaces_below, current.link) {
-        WSurface *surface = WSurface::fromHandle(subsurface->surface);
-        if (!surface)
-            continue;
-        WSurfaceItem *item = ensureSubsurfaceItem(surface);
-        item->setZ(qreal(WSurfaceItem::ZOrder::BelowSubsurface));
-        item->setSurfaceSizeRatio(surfaceSizeRatio);
-        Q_ASSERT(item->parentItem() == q);
-        if (prev) {
-            Q_ASSERT(prev->parentItem() == item->parentItem());
-            item->stackAfter(prev);
+    updateSubsurfaceContainers();
+    auto updateForContainer = [this](wl_list *subsurfaceList, QQuickItem *container) {
+        wlr_subsurface *subsurface;
+        QQuickItem *prev = nullptr;
+        wl_list_for_each(subsurface, subsurfaceList, current.link) {
+            WSurface *surface = WSurface::fromHandle(subsurface->surface);
+            if (!surface)
+                continue;
+            WSurfaceItem *item = ensureSubsurfaceItem(surface, container);
+            item->setSurfaceSizeRatio(surfaceSizeRatio);
+            Q_ASSERT(item->parentItem() == container);
+            if (prev) {
+                Q_ASSERT(prev->parentItem() == item->parentItem());
+                item->stackAfter(prev);
+            }
+            prev = item;
+            const QPointF pos = contentContainer->position() + QPointF(subsurface->current.x, subsurface->current.y) / surfaceSizeRatio;
+            item->setPosition(pos);
         }
-        prev = item;
-        const QPointF pos = contentContainer->position() + QPointF(subsurface->current.x, subsurface->current.y) / surfaceSizeRatio;
-        item->setPosition(pos);
-    }
-
-    wl_list_for_each(subsurface, &surface->current.subsurfaces_above, current.link) {
-        WSurface *surface = WSurface::fromHandle(subsurface->surface);
-        if (!surface)
-            continue;
-        WSurfaceItem *item = ensureSubsurfaceItem(surface);
-        item->setZ(qreal(WSurfaceItem::ZOrder::AboveSubsurface));
-        item->setSurfaceSizeRatio(surfaceSizeRatio);
-        Q_ASSERT(item->parentItem() == q);
-        if (prev) {
-            Q_ASSERT(prev->parentItem() == item->parentItem());
-            item->stackAfter(prev);
-        }
-        prev = item;
-        const QPointF pos = contentContainer->position() + QPointF(subsurface->current.x, subsurface->current.y) / surfaceSizeRatio;
-        item->setPosition(pos);
-    }
-
+    };
+    updateForContainer(&surface->current.subsurfaces_below, belowSubsurfaceContainer);
+    updateForContainer(&surface->current.subsurfaces_above, aboveSubsurfaceContainer);
     updateBoundingRect();
 }
 
@@ -1130,19 +1215,25 @@ void WSurfaceItemPrivate::updateContentPosition()
     updateBoundingRect();
 }
 
-WSurfaceItem *WSurfaceItemPrivate::ensureSubsurfaceItem(WSurface *subsurfaceSurface)
+WSurfaceItem *WSurfaceItemPrivate::ensureSubsurfaceItem(WSurface *subsurfaceSurface, QQuickItem *parent)
 {
     for (int i = 0; i < subsurfaces.count(); ++i) {
         auto surfaceItem = subsurfaces.at(i);
         WSurface *surface = surfaceItem->d_func()->surface.get();
 
-        if (surface && surface == subsurfaceSurface)
-            return surfaceItem;
+        if (surface && surface == subsurfaceSurface) {
+            if (surfaceItem->parent() == parent) {
+                return surfaceItem;
+            } else {
+                subsurfaces.removeOne(surfaceItem);
+                break;
+            }
+        }
     }
 
     Q_Q(WSurfaceItem);
     Q_ASSERT(subsurfaceSurface);
-    auto surfaceItem = new WSurfaceItem(q);
+    auto surfaceItem = new WSurfaceItem(parent);
     // Delay destroy WSurfaceItem, because if the cause of destroy is because the parent
     // surface destroy, and the parent WSurfaceItem::cacheLastBuffer maybe enabled,
     // will disable this connection at parent WSurfaceItem::releaseResources to save the
@@ -1150,8 +1241,10 @@ WSurfaceItem *WSurfaceItemPrivate::ensureSubsurfaceItem(WSurface *subsurfaceSurf
     // contents.
     // AutoDestroy: Connect to this(parent)'s lambda since the autodestroy is managed by parent,
     // avoids disconnected with all slots on subsurfaceItem in subsurface's releaseResources
-    subsurfaceSurface->safeConnect(&WSurface::destroyed,
-                             q, [this,surfaceItem]{ surfaceItem->deleteLater(); }, Qt::QueuedConnection);
+    QObject::connect(subsurfaceSurface, &WSurface::destroyed, q, [this,surfaceItem] {
+        subsurfaces.removeOne(surfaceItem);
+        surfaceItem->deleteLater();
+    }, Qt::QueuedConnection);
     surfaceItem->setDelegate(delegate);
     surfaceItem->setFlags(surfaceFlags);
     surfaceItem->setSurface(subsurfaceSurface);
@@ -1165,6 +1258,43 @@ WSurfaceItem *WSurfaceItemPrivate::ensureSubsurfaceItem(WSurface *subsurfaceSurf
     Q_EMIT q->subsurfaceAdded(surfaceItem);
 
     return surfaceItem;
+}
+
+void WSurfaceItemPrivate::updateSubsurfaceContainers()
+{
+    Q_Q(WSurfaceItem);
+    if (wl_list_empty(&surface->handle()->handle()->current.subsurfaces_below) && belowSubsurfaceContainer) {
+        if (belowSubsurfaceContainer->isEmpty()) {
+            delete belowSubsurfaceContainer;
+        } else {
+            belowSubsurfaceContainer->deleteAfterEmpty();
+        }
+    } else if (!wl_list_empty(&surface->handle()->handle()->current.subsurfaces_below) && !belowSubsurfaceContainer) {
+        belowSubsurfaceContainer = new SubsurfaceContainer(q);
+        belowSubsurfaceContainer->setZ(static_cast<qreal>(WSurfaceItem::ZOrder::BelowSubsurface));
+        belowSubsurfaceContainer->setVisible(subsurfacesVisible);
+        QQuickItemPrivate::get(belowSubsurfaceContainer)->anchors()->setFill(q);
+        QObject::connect(belowSubsurfaceContainer, &SubsurfaceContainer::subsurfaceRemoved, q, [this, q](WSurfaceItem *item) {
+            updateBoundingRect();
+            Q_EMIT q->subsurfaceRemoved(item);
+        });
+    }
+    if (wl_list_empty(&surface->handle()->handle()->current.subsurfaces_above) && aboveSubsurfaceContainer) {
+        if (aboveSubsurfaceContainer->isEmpty()) {
+            delete aboveSubsurfaceContainer;
+        } else {
+            aboveSubsurfaceContainer->deleteAfterEmpty();
+        }
+    } else if (!wl_list_empty(&surface->handle()->handle()->current.subsurfaces_above)  && !aboveSubsurfaceContainer) {
+        aboveSubsurfaceContainer = new SubsurfaceContainer(q);
+        aboveSubsurfaceContainer->setZ(static_cast<qreal>(WSurfaceItem::ZOrder::AboveSubsurface));
+        aboveSubsurfaceContainer->setVisible(subsurfacesVisible);
+        QQuickItemPrivate::get(aboveSubsurfaceContainer)->anchors()->setFill(q);
+        QObject::connect(aboveSubsurfaceContainer, &SubsurfaceContainer::subsurfaceRemoved, q, [this, q](WSurfaceItem *item) {
+            updateBoundingRect();
+            Q_EMIT q->subsurfaceRemoved(item);
+        });
+    }
 }
 
 void WSurfaceItemPrivate::resizeSurfaceToItemSize(const QSize &itemSize, const QSize &sizeDiff)
@@ -1246,7 +1376,7 @@ qreal WSurfaceItemPrivate::calculateImplicitWidth() const
     if (!surfaceState)
         return ps.width();
 
-    return surfaceState->contentGeometry.width() + ps.width();
+    return surfaceState->contentGeometry.width() / surfaceSizeRatio + ps.width();
 }
 
 qreal WSurfaceItemPrivate::calculateImplicitHeight() const
@@ -1255,7 +1385,7 @@ qreal WSurfaceItemPrivate::calculateImplicitHeight() const
     if (!surfaceState)
         return ps.height();
 
-    return surfaceState->contentGeometry.height() + ps.height();
+    return surfaceState->contentGeometry.height() / surfaceSizeRatio + ps.height();
 }
 
 QRectF WSurfaceItemPrivate::calculateBoundingRect() const
@@ -1329,6 +1459,25 @@ void WSurfaceItemContentPrivate::cleanTextureProvider()
 
         textureProvider = nullptr;
     }
+}
+
+bool WSurfaceItem::subsurfacesVisible() const
+{
+    Q_D(const WSurfaceItem);
+    return d->subsurfacesVisible;
+}
+
+void WSurfaceItem::setSubsurfacesVisible(bool newSubsurfacesVisible)
+{
+    Q_D(WSurfaceItem);
+    if (d->subsurfacesVisible == newSubsurfacesVisible)
+        return;
+    d->subsurfacesVisible = newSubsurfacesVisible;
+    if (d->belowSubsurfaceContainer)
+        d->belowSubsurfaceContainer->setVisible(d->subsurfacesVisible);
+    if (d->aboveSubsurfaceContainer)
+        d->aboveSubsurfaceContainer->setVisible(d->subsurfacesVisible);
+    Q_EMIT subsurfacesVisibleChanged();
 }
 
 WAYLIB_SERVER_END_NAMESPACE

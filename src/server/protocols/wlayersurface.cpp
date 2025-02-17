@@ -34,7 +34,6 @@ public:
 
     void init();
     void connect();
-    void updatePosition();
     void instantRelease();
 
     bool setDesiredSize(QSize newSize);
@@ -391,6 +390,11 @@ WLayerSurface::KeyboardInteractivity WLayerSurface::keyboardInteractivity() cons
     return d->keyboardInteractivity;
 }
 
+QString WLayerSurface::scope() const
+{
+    return QString::fromLocal8Bit((*handle())->scope);
+}
+
 WOutput *WLayerSurface::output() const
 {
     W_DC(WLayerSurface);
@@ -426,11 +430,14 @@ void WLayerSurface::closed()
     wlr_layer_surface_v1_destroy(nativeHandle());
 }
 
-bool WLayerSurface::checkNewSize(const QSize &size)
+bool WLayerSurface::checkNewSize(const QSize &size,  QSize *clipedSize)
 {
     W_D(WLayerSurface);
 
-    if (size.width() <= 0 || size.height() <= 0) {
+    // If the width or height arguments are zero, it means the client should decide its own window dimension.
+    if (size.width() < 0 || size.height() < 0) {
+        if (clipedSize)
+            *clipedSize = QSize(0, 0);
         return false;
     }
     return true;

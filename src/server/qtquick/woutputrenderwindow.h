@@ -77,12 +77,14 @@ Q_SIGNALS:
     void initialized();
     void disableLayersChanged();
     void renderEnd();
+    void effectiveDevicePixelRatioChanged(qreal scale);
 
 private:
     void classBegin() override;
     void componentComplete() override;
 
     bool event(QEvent *event) override;
+    bool eventFilter(QObject *watched, QEvent *event) override;
 
     friend class WOutputViewport;
     QList<WOutputLayer*> layers(const WOutputViewport *output) const;
